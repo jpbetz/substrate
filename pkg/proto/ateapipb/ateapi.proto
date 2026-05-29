@@ -38,10 +38,10 @@ service Control {
   // Delete an actor. Only suspended actors can be deleted.
   rpc DeleteActor(DeleteActorRequest) returns (DeleteActorResponse) {}
 
-  // List all workers currently reflected in redis.
+  // List all workers currently reflected in the state store.
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse) {}
 
-  // List all actors currently reflected in redis.
+  // List all actors currently reflected in the state store.
   rpc ListActors(ListActorsRequest) returns (ListActorsResponse) {}
 
   // Debugging: drop all data from the ate database.

@@ -26,7 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/ateredis"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
@@ -34,9 +35,7 @@ import (
 	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/alicebob/miniredis/v2"
 	"github.com/google/go-cmp/cmp"
-	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -201,12 +200,11 @@ func (f *FakeAteletServer) Restore(ctx context.Context, req *ateletpb.RestoreReq
 }
 
 type testContext struct {
-	mr                  *miniredis.Miniredis
 	service             *Service
 	client              ateapipb.ControlClient
 	k8sClient           kubernetes.Interface
 	substrateClient     versioned.Interface
-	persistence         *ateredis.Persistence
+	persistence         store.Interface
 	fakeAtelet          *FakeAteletServer
 	cleanup             func()
 	actorTemplateLister listersv1alpha1.ActorTemplateLister
@@ -215,27 +213,19 @@ type testContext struct {
 // setupTest sets up a fully isolated test environment.
 func setupTest(t *testing.T, ns string) *testContext {
 	t.Helper()
-	// 1. Start Miniredis
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("failed to start miniredis: %v", err)
-	}
-
-	rdb := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs: []string{mr.Addr()},
-	})
-	persistence := ateredis.NewPersistence(rdb)
+	// 1. Start a throwaway etcd-backed store.
+	persistence, etcdCleanup := storetest.SetupTestStore(t)
 
 	// 2. Initialize Clientsets using global cfg
 	k8sClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		mr.Close()
+		etcdCleanup()
 		t.Fatalf("failed to create k8s clientset: %v", err)
 	}
 
 	substrateClient, err := versioned.NewForConfig(cfg)
 	if err != nil {
-		mr.Close()
+		etcdCleanup()
 		t.Fatalf("failed to create substrate clientset: %v", err)
 	}
 
@@ -270,7 +260,7 @@ func setupTest(t *testing.T, ns string) *testContext {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		cancel()
-		mr.Close()
+		etcdCleanup()
 		t.Fatalf("failed to listen: %v", err)
 	}
 
@@ -284,7 +274,7 @@ func setupTest(t *testing.T, ns string) *testContext {
 	if err != nil {
 		grpcServer.Stop()
 		cancel()
-		mr.Close()
+		etcdCleanup()
 		t.Fatalf("failed to connect: %v", err)
 	}
 
@@ -301,7 +291,7 @@ func setupTest(t *testing.T, ns string) *testContext {
 		conn.Close()
 		grpcServer.Stop()
 		cancel()
-		mr.Close()
+		etcdCleanup()
 		t.Fatalf("failed to create namespace %s: %v", ns, err)
 	}
 
@@ -309,11 +299,10 @@ func setupTest(t *testing.T, ns string) *testContext {
 		conn.Close()
 		grpcServer.Stop()
 		cancel()
-		mr.Close()
+		etcdCleanup()
 	}
 
 	return &testContext{
-		mr:                  mr,
 		service:             service,
 		client:              client,
 		k8sClient:           k8sClient,
@@ -636,10 +625,10 @@ func TestListActors(t *testing.T) {
 	}
 }
 
-// TestListWorkers tests that workers mirrored to Redis are listed.
+// TestListWorkers tests that workers mirrored to etcd are listed.
 // Workflow:
 // 1. Creates a mock worker Pod in Kubernetes.
-// 2. Waits for the background WorkerPoolSyncer to mirror it to Redis.
+// 2. Waits for the background WorkerPoolSyncer to mirror it to etcd.
 // 3. Calls ListWorkers RPC.
 // 4. Verifies that the worker appears in the response.
 func TestListWorkers(t *testing.T) {
@@ -681,7 +670,7 @@ func TestListWorkers(t *testing.T) {
 // 1. Creates a mock ActorTemplate.
 // 2. Creates a mock Atelet Pod in 'ate-system' namespace on 'node1'.
 // 3. Creates a mock worker Pod in the test namespace on 'node1'.
-// 4. Waits for the WorkerPoolSyncer to mirror the worker to Redis.
+// 4. Waits for the WorkerPoolSyncer to mirror the worker to etcd.
 // 5. Creates an actor (starts as SUSPENDED).
 // 6. Calls ResumeActor RPC.
 // 7. Verifies that the fake Atelet received the Restore call.
@@ -844,7 +833,7 @@ func TestResumeActor_Reentrancy(t *testing.T) {
 		t.Fatalf("expected ResumeActor to fail due to atelet error")
 	}
 
-	// Verify actor state is RESUMING in Redis!
+	// Verify actor state is RESUMING in etcd!
 	actor, err := tc.persistence.GetActor(context.Background(), id)
 	if err != nil {
 		t.Fatalf("failed to get actor from store: %v", err)
@@ -883,7 +872,7 @@ func TestResumeActor_Reentrancy(t *testing.T) {
 // 1. Creates a mock ActorTemplate.
 // 2. Creates a mock Atelet Pod on 'node1'.
 // 3. Creates a mock worker Pod on 'node1'.
-// 4. Waits for the WorkerPoolSyncer to mirror the worker to Redis.
+// 4. Waits for the WorkerPoolSyncer to mirror the worker to etcd.
 // 5. Creates an actor.
 // 6. Calls ResumeActor to transition it to RUNNING.
 // 7. Calls SuspendActor RPC.
@@ -1204,7 +1193,7 @@ func TestSuspendActor_DanglingWorker(t *testing.T) {
 
 	// 3. Call SuspendActor -> Should succeed (our fix skips missing pod execution)
 	actors, _ := tc.persistence.ListActors(context.Background())
-	t.Logf("Actors in Redis before Suspend: %d", len(actors))
+	t.Logf("Actors in etcd before Suspend: %d", len(actors))
 	for _, a := range actors {
 		t.Logf("  Actor: %s/%s/%s", a.GetActorTemplateNamespace(), a.GetActorTemplateName(), a.GetActorId())
 	}
@@ -1216,7 +1205,7 @@ func TestSuspendActor_DanglingWorker(t *testing.T) {
 		t.Fatalf("SuspendActor failed: %v", err)
 	}
 
-	// 4. Verify it becomes SUSPENDED in Redis
+	// 4. Verify it becomes SUSPENDED in etcd
 	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{
 		ActorId: id,
 	})

@@ -23,21 +23,21 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/sessionidentity"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/ateredis"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/ateetcd"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
 	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/redis/go-redis/v9"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"golang.org/x/oauth2/google"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
@@ -50,11 +50,10 @@ var (
 	metricsListenAddr    = flag.String("metrics-listen-addr", ":9090", "Address and port the prometheus metrics server should listen on.")
 	grpcServerCredBundle = flag.String("grpc-server-cred-bundle", "", "File with the server TLS credential bundle.")
 
-	redisClusterAddress = flag.String("redis-cluster-address", "", "The address of the redis cluster.")
-	redisCACerts        = flag.String("redis-ca-certs", "", "The file that contains the CA certificate for Redis cluster.")
-	redisUseIAMAuth     = flag.String("redis-use-iam-auth", "true", "Whether to use Google IAM authentication for Redis/Valkey.")
-	redisTLSServerName  = flag.String("redis-tls-server-name", "", "The ServerName to use for Redis TLS hostname verification.")
-	redisClientCert     = flag.String("redis-client-cert", "", "The file containing client TLS certificate/key credential bundle for Redis/Valkey.")
+	etcdEndpoints     = flag.String("etcd-endpoints", "", "Comma-separated list of etcd client endpoints (e.g. https://etcd-0.etcd.ate-system.svc:2379).")
+	etcdCACerts       = flag.String("etcd-ca-certs", "", "The file that contains the CA certificate for the etcd cluster.")
+	etcdTLSServerName = flag.String("etcd-tls-server-name", "", "The ServerName to use for etcd TLS hostname verification.")
+	etcdClientCert    = flag.String("etcd-client-cert", "", "The file containing the client TLS certificate/key credential bundle for etcd.")
 
 	clientJWTIssuer      = flag.String("client-jwt-issuer", "", "The expected issuer URL for client JWTs.")
 	clientJWTAudience    = flag.String("client-jwt-audience", "", "The expected audience for client JWTs.")
@@ -87,10 +86,11 @@ func main() {
 	loadFlagsFromEnv()
 	logFlagValues(ctx)
 
-	redisClient, err := connectRedis(ctx)
+	etcdClient, err := connectEtcd(ctx)
 	if err != nil {
-		serverboot.Fatal(ctx, "Failed to set up Redis/Valkey", err)
+		serverboot.Fatal(ctx, "Failed to set up etcd", err)
 	}
+	defer etcdClient.Close()
 
 	clientset, ateClient, err := newKubeClients()
 	if err != nil {
@@ -102,7 +102,7 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to build server credentials", err)
 	}
 
-	redisPersistence := ateredis.NewPersistence(redisClient)
+	etcdPersistence := ateetcd.NewPersistence(etcdClient)
 
 	ateFactory := externalversions.NewSharedInformerFactory(ateClient, 0)
 	actorTemplateLister := ateFactory.Api().V1alpha1().ActorTemplates().Lister()
@@ -110,7 +110,7 @@ func main() {
 	workerPodInformerFactory, workerPodInformer := controlapi.WorkerPodInformer(clientset)
 	ateletPodInformerFactory, ateletPodInformer := controlapi.AteletInformer(clientset)
 
-	syncer := controlapi.NewWorkerPoolSyncer(redisPersistence, workerPodInformer)
+	syncer := controlapi.NewWorkerPoolSyncer(etcdPersistence, workerPodInformer)
 	syncer.Start(ctx)
 
 	stopCh := make(chan struct{})
@@ -124,7 +124,7 @@ func main() {
 	ateFactory.WaitForCacheSync(stopCh)
 
 	dialer := controlapi.NewAteletDialer(workerPodInformer.GetIndexer(), ateletPodInformer.GetIndexer())
-	sm := controlapi.NewService(redisPersistence, actorTemplateLister, dialer)
+	sm := controlapi.NewService(etcdPersistence, actorTemplateLister, dialer)
 
 	sessionIdentitySrv := sessionidentity.New(*clientJWTIssuer, *clientJWTAudience, *sessionIDJWTPoolFile, *sessionIDCAPoolFile, *workerpoolCACerts)
 
@@ -162,11 +162,10 @@ func loadFlagsFromEnv() {
 		flag *string
 		env  string
 	}{
-		{redisClusterAddress, "ATE_API_REDIS_ADDRESS"},
+		{etcdEndpoints, "ATE_API_ETCD_ENDPOINTS"},
 		{clientJWTIssuer, "ATE_API_K8SJWT_ISSUER"},
-		{redisUseIAMAuth, "ATE_API_REDIS_USE_IAM_AUTH"},
-		{redisTLSServerName, "ATE_API_REDIS_TLS_SERVER_NAME"},
-		{redisClientCert, "ATE_API_REDIS_CLIENT_CERT"},
+		{etcdTLSServerName, "ATE_API_ETCD_TLS_SERVER_NAME"},
+		{etcdClientCert, "ATE_API_ETCD_CLIENT_CERT"},
 	}
 	for _, o := range overrides {
 		if *o.flag == "@env" {
@@ -179,11 +178,10 @@ func logFlagValues(ctx context.Context) {
 	slog.InfoContext(ctx, "Final flag values",
 		slog.String("grpc-listen-addr", *listenAddr),
 		slog.String("grpc-server-cred-bundle", *grpcServerCredBundle),
-		slog.String("redis-cluster-address", *redisClusterAddress),
-		slog.String("redis-ca-certs", *redisCACerts),
-		slog.String("redis-use-iam-auth", *redisUseIAMAuth),
-		slog.String("redis-tls-server-name", *redisTLSServerName),
-		slog.String("redis-client-cert", *redisClientCert),
+		slog.String("etcd-endpoints", *etcdEndpoints),
+		slog.String("etcd-ca-certs", *etcdCACerts),
+		slog.String("etcd-tls-server-name", *etcdTLSServerName),
+		slog.String("etcd-client-cert", *etcdClientCert),
 		slog.String("client-jwt-issuer", *clientJWTIssuer),
 		slog.String("client-jwt-audience", *clientJWTAudience),
 		slog.String("session-id-jwt-pool", *sessionIDJWTPoolFile),
@@ -192,89 +190,100 @@ func logFlagValues(ctx context.Context) {
 	)
 }
 
-// connectRedis builds the Redis/Valkey TLS config, plumbs IAM auth if
-// requested, opens the cluster client, and pings with retries.
-func connectRedis(ctx context.Context) (*redis.ClusterClient, error) {
-	tlsConfig, err := buildRedisTLSConfig(ctx)
+// connectEtcd builds the etcd TLS config, opens the client, and verifies
+// connectivity with retries.
+func connectEtcd(ctx context.Context) (*clientv3.Client, error) {
+	endpoints := splitEndpoints(*etcdEndpoints)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no etcd endpoints configured (set --etcd-endpoints or ATE_API_ETCD_ENDPOINTS)")
+	}
+
+	tlsConfig, err := buildEtcdTLSConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	clusterOpts := &redis.ClusterOptions{
-		Addrs:     []string{*redisClusterAddress},
-		TLSConfig: tlsConfig,
+	client, err := clientv3.New(clientv3.Config{
+		Endpoints:   endpoints,
+		TLS:         tlsConfig,
+		DialTimeout: 5 * time.Second,
+		Context:     ctx,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create etcd client: %w", err)
 	}
 
-	if *redisUseIAMAuth != "false" {
-		creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
-		if err != nil {
-			return nil, fmt.Errorf("find default credentials for Redis IAM auth: %w", err)
-		}
-		tokenSource := creds.TokenSource
-		clusterOpts.CredentialsProvider = func() (string, string) {
-			tok, err := tokenSource.Token()
-			if err != nil {
-				slog.Error("Failed to fetch Redis IAM token", slog.Any("err", err))
-				return "default", ""
-			}
-			return "default", tok.AccessToken
-		}
-		slog.InfoContext(ctx, "Using Google IAM authentication for Redis connection")
-	} else {
-		slog.InfoContext(ctx, "Skipping Google IAM authentication for Redis connection")
-	}
-
-	client := redis.NewClusterClient(clusterOpts)
-	if err := pingRedisWithRetries(ctx, client); err != nil {
+	if err := waitForEtcd(ctx, client, endpoints); err != nil {
+		client.Close()
 		return nil, err
 	}
 	return client, nil
 }
 
-func buildRedisTLSConfig(ctx context.Context) (*tls.Config, error) {
+// buildEtcdTLSConfig builds the client TLS config for etcd. It returns nil when
+// no TLS material is configured, which leaves the connection plaintext.
+func buildEtcdTLSConfig(ctx context.Context) (*tls.Config, error) {
+	if *etcdCACerts == "" && *etcdClientCert == "" && *etcdTLSServerName == "" {
+		return nil, nil
+	}
+
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if *redisCACerts != "" {
-		ca, err := os.ReadFile(*redisCACerts)
+	if *etcdCACerts != "" {
+		ca, err := os.ReadFile(*etcdCACerts)
 		if err != nil {
-			return nil, fmt.Errorf("read Redis CA cert: %w", err)
+			return nil, fmt.Errorf("read etcd CA cert: %w", err)
 		}
 		caPool := x509.NewCertPool()
 		if !caPool.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("parse Redis CA cert from %s", *redisCACerts)
+			return nil, fmt.Errorf("parse etcd CA cert from %s", *etcdCACerts)
 		}
 		tlsConfig.RootCAs = caPool
-		slog.InfoContext(ctx, "Using custom CA cert for Redis", slog.String("path", *redisCACerts))
+		slog.InfoContext(ctx, "Using custom CA cert for etcd", slog.String("path", *etcdCACerts))
 	}
-	if *redisTLSServerName != "" {
-		tlsConfig.ServerName = *redisTLSServerName
-		slog.InfoContext(ctx, "Using custom ServerName for Redis TLS verification", slog.String("name", *redisTLSServerName))
+	if *etcdTLSServerName != "" {
+		tlsConfig.ServerName = *etcdTLSServerName
+		slog.InfoContext(ctx, "Using custom ServerName for etcd TLS verification", slog.String("name", *etcdTLSServerName))
 	}
-	if *redisClientCert != "" {
-		cert, err := credbundle.Parse(*redisClientCert)
+	if *etcdClientCert != "" {
+		cert, err := credbundle.Parse(*etcdClientCert)
 		if err != nil {
-			return nil, fmt.Errorf("parse Redis client credential bundle: %w", err)
+			return nil, fmt.Errorf("parse etcd client credential bundle: %w", err)
 		}
 		tlsConfig.Certificates = []tls.Certificate{*cert}
-		slog.InfoContext(ctx, "Using client TLS certificate for Redis/Valkey", slog.String("path", *redisClientCert))
+		slog.InfoContext(ctx, "Using client TLS certificate for etcd", slog.String("path", *etcdClientCert))
 	}
 	return tlsConfig, nil
 }
 
-func pingRedisWithRetries(ctx context.Context, client *redis.ClusterClient) error {
-	var pingErr error
+func waitForEtcd(ctx context.Context, client *clientv3.Client, endpoints []string) error {
+	var statusErr error
 	for i := 0; i < 30; i++ {
-		pingErr = client.Ping(ctx).Err()
-		if pingErr == nil {
+		statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, statusErr = client.Status(statusCtx, endpoints[0])
+		cancel()
+		if statusErr == nil {
 			return nil
 		}
-		slog.WarnContext(ctx, "Failed to connect to Redis/Valkey, retrying...", slog.Int("attempt", i+1), slog.Any("err", pingErr))
+		slog.WarnContext(ctx, "Failed to connect to etcd, retrying...", slog.Int("attempt", i+1), slog.Any("err", statusErr))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
 	}
-	return fmt.Errorf("ping Redis/Valkey after 30 retries: %w", pingErr)
+	return fmt.Errorf("connect to etcd after 30 retries: %w", statusErr)
+}
+
+// splitEndpoints parses a comma-separated endpoint list, trimming whitespace
+// and dropping empty entries.
+func splitEndpoints(s string) []string {
+	var out []string
+	for _, e := range strings.Split(s, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // newKubeClients builds the standard Kubernetes clientset and the ate

@@ -77,7 +77,7 @@ function usage() {
   echo "  --create-jwt-authority-pool-secret     Create JWT authority pool secret"
   echo "  --create-session-id-ca-pool-secret     Create session ID CA pool secret"
   echo "  --create-podcertificate-controller-cas Create podcertificate controller CAs"
-  echo "  --create-valkey-ca-certs-secret        Create Valkey CA certs secret"
+  echo "  --create-etcd-ca-certs-secret          Create etcd CA certs secret"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
   echo ""
   for demo_name in "${ATE_DEMOS[@]}"; do
@@ -117,8 +117,8 @@ run_ko() {
   esac
 }
 
-create_valkey_ca_certs_secret() {
-  log_step "create_valkey_ca_certs_secret"
+create_etcd_ca_certs_secret() {
+  log_step "create_etcd_ca_certs_secret"
   local ca_certs=""
   # Extract from in-cluster service-dns-ca-pool secret (base64 json)
   local pool_json=""
@@ -129,7 +129,7 @@ create_valkey_ca_certs_secret() {
   # Convert DER to PEM certificate
   ca_certs=$(echo "${der_base64}" | base64 --decode | openssl x509 -inform der -outform pem)
 
-  run_kubectl create secret generic valkey-ca-certs \
+  run_kubectl create secret generic etcd-ca-certs \
     --from-literal=ca.crt="${ca_certs}" \
     -n ate-system \
     --dry-run=client -o yaml \
@@ -170,16 +170,17 @@ create_api_server_env_vars() {
   run_kubectl create namespace ate-system --dry-run=client -o yaml \
     | run_kubectl apply -f -
 
-  local redis_address=""
-  local use_iam_auth="true"
+  local etcd_endpoints=""
   local tls_server_name=""
   local client_cert=""
-  redis_address="valkey-cluster.ate-system.svc:6379"
-  use_iam_auth="false"
-  tls_server_name="valkey-cluster.ate-system.svc"
+  # The api-server connects to each etcd member by its stable per-pod DNS name,
+  # verifying each against the name embedded in that pod's certificate, so no
+  # single TLS ServerName override is set.
+  etcd_endpoints="https://etcd-0.etcd.ate-system.svc:2379,https://etcd-1.etcd.ate-system.svc:2379,https://etcd-2.etcd.ate-system.svc:2379"
+  tls_server_name=""
   client_cert="/run/servicedns.podcert.ate.dev/credential-bundle.pem"
 
-  echo "REDIS_ADDRESS: ${redis_address}"
+  echo "ETCD_ENDPOINTS: ${etcd_endpoints}"
 
   local jwt_issuer=""
   if [[ -n "${PROJECT_ID:-}" && -n "${CLUSTER_LOCATION:-}" && -n "${CLUSTER_NAME:-}" ]]; then
@@ -192,10 +193,9 @@ create_api_server_env_vars() {
   fi
 
   run_kubectl create configmap -n ate-system ate-api-server-envvars \
-    --from-literal=ATE_API_REDIS_ADDRESS="${redis_address}" \
-    --from-literal=ATE_API_REDIS_USE_IAM_AUTH="${use_iam_auth}" \
-    --from-literal=ATE_API_REDIS_TLS_SERVER_NAME="${tls_server_name}" \
-    --from-literal=ATE_API_REDIS_CLIENT_CERT="${client_cert}" \
+    --from-literal=ATE_API_ETCD_ENDPOINTS="${etcd_endpoints}" \
+    --from-literal=ATE_API_ETCD_TLS_SERVER_NAME="${tls_server_name}" \
+    --from-literal=ATE_API_ETCD_CLIENT_CERT="${client_cert}" \
     --from-literal=ATE_API_K8SJWT_ISSUER="${jwt_issuer}" \
     --dry-run=client -o yaml \
     | run_kubectl apply -f -
@@ -252,7 +252,7 @@ deploy_ate_system() {
   run_kubectl rollout status deployment/ate-api-server-deployment -n ate-system --timeout=120s
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
-  run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
+  run_kubectl rollout status statefulset/etcd -n ate-system --timeout=120s
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
 }
 
@@ -265,8 +265,8 @@ ensure_apiserver_prerequisites() {
     || create_session_id_ca_pool_secret
   run_kubectl get secret -n podcertificate-controller-system service-dns-ca-pool >/dev/null 2>&1 \
     || create_podcertificate_controller_cas
-  run_kubectl get secret -n ate-system valkey-ca-certs >/dev/null 2>&1 \
-    || create_valkey_ca_certs_secret
+  run_kubectl get secret -n ate-system etcd-ca-certs >/dev/null 2>&1 \
+    || create_etcd_ca_certs_secret
   run_kubectl get configmap -n ate-system ate-api-server-envvars >/dev/null 2>&1 \
     || create_api_server_env_vars
 }
@@ -388,7 +388,7 @@ while [[ "$#" -gt 0 ]]; do
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
     --create-session-id-ca-pool-secret) create_session_id_ca_pool_secret ;;
     --create-podcertificate-controller-cas) create_podcertificate_controller_cas ;;
-    --create-valkey-ca-certs-secret) create_valkey_ca_certs_secret ;;
+    --create-etcd-ca-certs-secret) create_etcd_ca_certs_secret ;;
     --create-api-server-env-vars) create_api_server_env_vars ;;
 
     *)

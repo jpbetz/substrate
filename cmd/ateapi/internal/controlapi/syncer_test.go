@@ -30,7 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// setupSyncerTest sets up a real store with fake Redis and a fake K8s client with informer.
+// setupSyncerTest sets up a real store with fake etcd and a fake K8s client with informer.
 func setupSyncerTest(t *testing.T, ctx context.Context) (store.Interface, *fake.Clientset, func()) {
 	t.Helper()
 
@@ -59,7 +59,7 @@ func TestSyncer_Lifecycle(t *testing.T) {
 	podName := "worker-unit-1"
 	poolName := "pool1"
 
-	// 1. Verify no workers in Redis initially
+	// 1. Verify no workers in etcd initially
 	workers, err := persistence.ListWorkers(context.Background())
 	if err != nil {
 		t.Fatalf("failed to list workers: %v", err)
@@ -94,7 +94,7 @@ func TestSyncer_Lifecycle(t *testing.T) {
 	err = wait.PollUntilContextTimeout(context.Background(), 50*time.Millisecond, 500*time.Millisecond, true, func(ctx context.Context) (bool, error) {
 		_, err := persistence.GetWorker(ctx, ns, poolName, podName)
 		if err == nil {
-			return false, fmt.Errorf("worker unexpectedly found in Redis")
+			return false, fmt.Errorf("worker unexpectedly found in etcd")
 		}
 		if !errors.Is(err, store.ErrNotFound) {
 			return false, err
@@ -131,7 +131,7 @@ func TestSyncer_Lifecycle(t *testing.T) {
 		return w.Ip == "127.0.0.1", nil
 	})
 	if err != nil {
-		t.Fatalf("Worker not found in Redis after update: %v", err)
+		t.Fatalf("Worker not found in etcd after update: %v", err)
 	}
 
 	// 8. Delete it
@@ -152,7 +152,7 @@ func TestSyncer_Lifecycle(t *testing.T) {
 		return false, nil
 	})
 	if err != nil {
-		t.Fatalf("Worker still found in Redis after deletion: %v", err)
+		t.Fatalf("Worker still found in etcd after deletion: %v", err)
 	}
 }
 

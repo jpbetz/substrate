@@ -73,11 +73,10 @@ spec:
         args:
           - "--grpc-listen-addr=0.0.0.0:443"
           - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
-          - --redis-cluster-address=@env
-          - --redis-ca-certs=/etc/valkey-ca/ca.crt
-          - --redis-use-iam-auth=@env
-          - --redis-tls-server-name=@env
-          - --redis-client-cert=@env
+          - --etcd-endpoints=@env
+          - --etcd-ca-certs=/etc/etcd-ca/ca.crt
+          - --etcd-tls-server-name=@env
+          - --etcd-client-cert=@env
           - --client-jwt-issuer=@env
           - --client-jwt-audience=api.ate-system.svc
           - --session-id-jwt-pool=/run/session-id-jwt-pool/pool.json
@@ -87,7 +86,7 @@ spec:
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
         # Inject env vars from a ConfigMap created by each developer.  This lets
-        # each developer customize their own redis address, etc, without having
+        # each developer customize their own etcd endpoints, etc, without having
         # to edit this manifest, which can remain constant across all
         # developers.
         envFrom:
@@ -100,8 +99,8 @@ spec:
         - name: "session-id-jwt-pool"
           mountPath: "/run/session-id-jwt-pool"
         # Note: See README.md for how to generate this secret.
-        - name: "valkey-ca-certs"
-          mountPath: "/etc/valkey-ca"
+        - name: "etcd-ca-certs"
+          mountPath: "/etc/etcd-ca"
           readOnly: true
         - name: "session-id-ca-pool"
           mountPath: "/run/session-id-ca-pool"
@@ -135,11 +134,11 @@ spec:
               items: 
               - key: "pool"
                 path: "pool.json"
-      - name: "valkey-ca-certs"
+      - name: "etcd-ca-certs"
         projected:
           sources:
           - secret:
-              name: "valkey-ca-certs"
+              name: "etcd-ca-certs"
               items:
               - key: "ca.crt"
                 path: "ca.crt"

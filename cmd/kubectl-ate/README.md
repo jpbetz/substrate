@@ -84,7 +84,7 @@ kubectl ate get actor <actor-id> -o yaml
 kubectl ate get workers
 ```
 
-> **Note:** Actors and workers are not Kubernetes CRDs — they live in the Substrate control plane (valkey/redis), not `etcd`. `kubectl get actor` and `kubectl get worker` will not return anything; only `kubectl ate get …` queries the control plane. `kubectl get actortemplate` and `kubectl get workerpool` *do* work, because those are CRDs.
+> **Note:** Actors and workers are not Kubernetes CRDs — they live in the Substrate control plane's own state store (a dedicated etcd), not the Kubernetes API server. `kubectl get actor` and `kubectl get worker` will not return anything; only `kubectl ate get …` queries the control plane. `kubectl get actortemplate` and `kubectl get workerpool` *do* work, because those are CRDs.
 
 #### `kubectl ate get actor` output columns
 
@@ -154,6 +154,6 @@ kubectl ate admin make-jwt-pool \
   --secret-namespace ate-system \
   --key-id "1"
 
-# DANGEROUS: Completely flush all Actor and Worker tracking state from Redis
-kubectl ate admin debug-flush-redis
+# DANGEROUS: Completely flush all Actor and Worker tracking state from etcd
+kubectl ate admin debug-flush-etcd
 ```

@@ -22,9 +22,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var debugRedisFlushCmd = &cobra.Command{
-	Use:   "debug-flush-redis",
-	Short: "DANGEROUS: Flush all data from Redis",
+var debugEtcdFlushCmd = &cobra.Command{
+	Use:   "debug-flush-etcd",
+	Short: "DANGEROUS: Flush all data from etcd",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 		apiClient, err := ateclient.NewClient(ctx, kubeconfig, k8sContext, endpoint, traceEnabled)
@@ -35,14 +35,14 @@ var debugRedisFlushCmd = &cobra.Command{
 
 		_, err = apiClient.DebugClear(ctx, &ateapipb.DebugClearRequest{})
 		if err != nil {
-			return fmt.Errorf("failed to flush redis: %w", err)
+			return fmt.Errorf("failed to flush etcd: %w", err)
 		}
 
-		fmt.Println("Successfully flushed all data from Redis.")
+		fmt.Println("Successfully flushed all data from etcd.")
 		return nil
 	},
 }
 
 func init() {
-	adminCmd.AddCommand(debugRedisFlushCmd)
+	adminCmd.AddCommand(debugEtcdFlushCmd)
 }

@@ -61,9 +61,9 @@ type ControlClient interface {
 	ResumeActor(ctx context.Context, in *ResumeActorRequest, opts ...grpc.CallOption) (*ResumeActorResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
 	DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*DeleteActorResponse, error)
-	// List all workers currently reflected in redis.
+	// List all workers currently reflected in the state store.
 	ListWorkers(ctx context.Context, in *ListWorkersRequest, opts ...grpc.CallOption) (*ListWorkersResponse, error)
-	// List all actors currently reflected in redis.
+	// List all actors currently reflected in the state store.
 	ListActors(ctx context.Context, in *ListActorsRequest, opts ...grpc.CallOption) (*ListActorsResponse, error)
 	// Debugging: drop all data from the ate database.
 	DebugClear(ctx context.Context, in *DebugClearRequest, opts ...grpc.CallOption) (*DebugClearResponse, error)
@@ -173,9 +173,9 @@ type ControlServer interface {
 	ResumeActor(context.Context, *ResumeActorRequest) (*ResumeActorResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
 	DeleteActor(context.Context, *DeleteActorRequest) (*DeleteActorResponse, error)
-	// List all workers currently reflected in redis.
+	// List all workers currently reflected in the state store.
 	ListWorkers(context.Context, *ListWorkersRequest) (*ListWorkersResponse, error)
-	// List all actors currently reflected in redis.
+	// List all actors currently reflected in the state store.
 	ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error)
 	// Debugging: drop all data from the ate database.
 	DebugClear(context.Context, *DebugClearRequest) (*DebugClearResponse, error)
