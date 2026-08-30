@@ -106,6 +106,12 @@ func (s *updateWorkerErrorStore) UpdateWorker(context.Context, string, store.Pre
 	return nil, s.err
 }
 
+// The bind reports which half lost, so the failure is labeled as the store
+// would label it.
+func (s *updateWorkerErrorStore) UpdateActorAndWorker(context.Context, resources.ActorRef, store.Precondition, func(*ateapipb.Actor) error, string, store.Precondition, func(*ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error) {
+	return nil, nil, fmt.Errorf("%w: %w", store.ErrWorkerGuard, s.err)
+}
+
 func TestAssignWorkerAttempt_MissingSelectedWorkerIsRetried(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -456,6 +462,11 @@ type conflictInjectingStore struct {
 func (c *conflictInjectingStore) UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(*ateapipb.Actor) error) (*ateapipb.Actor, error) {
 	c.once.Do(c.inject)
 	return c.Interface.UpdateActor(ctx, actorRef, precondition, mutate)
+}
+
+func (c *conflictInjectingStore) UpdateActorAndWorker(ctx context.Context, actorRef resources.ActorRef, actorPrecondition store.Precondition, mutateActor func(*ateapipb.Actor) error, workerName string, workerPrecondition store.Precondition, mutateWorker func(*ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error) {
+	c.once.Do(c.inject)
+	return c.Interface.UpdateActorAndWorker(ctx, actorRef, actorPrecondition, mutateActor, workerName, workerPrecondition, mutateWorker)
 }
 
 func (c *conflictInjectingStore) UpdateActorSnapshotTag(ctx context.Context, tagRef resources.ActorSnapshotTagRef, precondition store.Precondition, mutate func(*ateapipb.ActorSnapshotTag) error) (*ateapipb.ActorSnapshotTag, error) {

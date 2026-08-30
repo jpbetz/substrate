@@ -117,6 +117,7 @@ type actorWorkflowStore interface {
 	DeleteActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)
 	UpdateWorker(ctx context.Context, name string, precondition store.Precondition, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error)
+	UpdateActorAndWorker(ctx context.Context, actorRef resources.ActorRef, actorPrecondition store.Precondition, mutateActor func(toUpdate *ateapipb.Actor) error, workerName string, workerPrecondition store.Precondition, mutateWorker func(toUpdate *ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error)
 	GetActorSnapshot(ctx context.Context, snapshotRef resources.ActorSnapshotRef) (*ateapipb.ActorSnapshot, error)
 	CreateActorSnapshot(ctx context.Context, snapshot *ateapipb.ActorSnapshot) (*ateapipb.ActorSnapshot, error)
 	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)

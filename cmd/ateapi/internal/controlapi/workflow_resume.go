@@ -428,11 +428,15 @@ func schedulerRecordable(err error) bool {
 	return !errors.Is(err, store.ErrVersionConflict)
 }
 
-// assignWorkerAttempt makes one attempt at claiming a worker for the actor
-// and persisting RESUMING with the assignment. On a version conflict it
-// re-reads the actor: if the fresh copy can still be resumed the refreshed
-// actor is returned along with the conflict so the caller retries with clean
-// inputs; any other status aborts the resume.
+// assignWorkerAttempt makes one attempt at binding the actor to a worker: the
+// worker's claim and the actor's transition to RESUMING are a single store
+// write, so an attempt either binds the pair or leaves nothing behind.
+//
+// The two guards fail differently. A lost worker guard forgets a vanished
+// incarnation and reports a version conflict, so the caller re-picks from a
+// view that no longer holds it. A lost actor guard re-reads the actor: if the
+// fresh copy can still be resumed it is returned along with the conflict so the
+// caller retries with clean inputs; any other status aborts the resume.
 func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	start := time.Now()
 	outcome := ateattr.SchedulerOutcomeError
@@ -525,29 +529,39 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		}
 	}
 
-	// Workers() returns pointers directly from the cache, so the claim is written
-	// by mutating the store's own copy; the cached one is only read, for the
-	// version this claim is conditioned on.
-	stored, err := w.store.UpdateWorker(ctx, assignedWorker.GetMetadata().GetName(), store.PreconditionFrom(assignedWorker), func(toUpdate *ateapipb.Worker) error {
+	// The worker's fields the assignment copies are immutable for its lifetime,
+	// so this reads the same values the claim will commit.
+	newAssignment := workerAssignmentFrom(assignedWorker)
+
+	// The claim and the actor's transition are one write. Writing them
+	// separately leaves a window in which the worker records a claim the actor
+	// never learned about, and nothing reclaims such a worker; the retry below
+	// widens that window, because the loop re-reads a cache that need not carry
+	// the claim yet and would then claim a second worker for the same actor.
+	//
+	// Workers() returns pointers directly from the cache, so the claim is
+	// written by mutating the store's own copy; the cached one is only read,
+	// for the version this claim is conditioned on.
+	workerName := assignedWorker.GetMetadata().GetName()
+	storedActor, storedWorker, err := w.store.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
+		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+		toUpdate.Status.WorkerAssignment = newAssignment
+		return nil
+	}, workerName, store.PreconditionFrom(assignedWorker), func(toUpdate *ateapipb.Worker) error {
 		toUpdate.Status.Assignment = assignment
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
-			return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
+		// Nothing was written, so which half lost decides only what the retry
+		// should read again, never what has to be cleaned up.
+		if errors.Is(err, store.ErrWorkerGuard) {
+			if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrUIDConflict) {
+				// The incarnation the cache holds is gone; drop it so the retry
+				// cannot pick it again from this replica's stale view.
+				w.workerCache.Forget(workerName)
+			}
+			return nil, nil, fmt.Errorf("selected worker changed before the claim landed: %w", store.ErrVersionConflict)
 		}
-		return nil, nil, err
-	}
-	assignedWorker = stored
-
-	newAssignment := workerAssignmentFrom(assignedWorker)
-	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
-		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
-		toUpdate.Status.WorkerAssignment = newAssignment
-		return nil
-	})
-	if err != nil {
 		if !errors.Is(err, store.ErrVersionConflict) {
 			return nil, nil, err
 		}
@@ -565,6 +579,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 			return nil, nil, status.Errorf(codes.Aborted, "actor %s is %s and can no longer be resumed", actorRef, fresh.GetStatus().GetState())
 		}
 	}
+	assignedWorker = storedWorker
 	poolNamespace = assignedWorker.GetWorkerNamespace()
 	pool = assignedWorker.GetWorkerPool()
 	outcome = ateattr.SchedulerOutcomeAssigned
