@@ -133,6 +133,34 @@ func TestAssignWorkerAttempt_MissingSelectedWorkerIsRetried(t *testing.T) {
 	}
 }
 
+// TestAssignWorkerAttempt_WorkerUIDConflictIsRetried covers the other way the
+// selected worker can be gone: the name survived but a new pod re-registered
+// under it, so the incarnation the cache holds no longer exists. Like a
+// deleted worker this is a bad pick rather than a failed resume, so the
+// stale entry is dropped and the attempt reports a version conflict for the
+// caller to retry on — which also keeps it out of the scheduler-assignment
+// instrument, since retried conflicts are not counted.
+func TestAssignWorkerAttempt_WorkerUIDConflictIsRetried(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	actor, wc := seedAssignFixture(t, ctx, persistence)
+	st := &updateWorkerErrorStore{Interface: persistence, err: store.ErrUIDConflict}
+	w := &ActorWorkflow{store: st, workerCache: wc, scheduler: scheduling.New(wc)}
+	tmpl := mustTemplateFromCRD(&atev1alpha1.ActorTemplate{Spec: atev1alpha1.ActorTemplateSpec{SandboxClass: atev1alpha1.SandboxClassGvisor}})
+
+	_, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	if !errors.Is(err, store.ErrVersionConflict) {
+		t.Fatalf("assignWorkerAttempt error = %v, want ErrVersionConflict", err)
+	}
+	workers, err := wc.Workers()
+	if err != nil {
+		t.Fatalf("Workers: %v", err)
+	}
+	if len(workers) != 0 {
+		t.Errorf("cached workers after a re-registered worker = %d, want 0", len(workers))
+	}
+}
+
 func TestEnsureWorkerAssigned_ConflictExhaustionIsRetryable(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -475,33 +503,54 @@ func (c *conflictInjectingStore) UpdateActorSnapshotTag(ctx context.Context, tag
 }
 
 // seedAssignFixture stores one free gvisor worker and a SUSPENDED actor and
-// returns the actor plus a started worker cache.
+// returns the actor plus a worker cache started over persistence.
 func seedAssignFixture(t *testing.T, ctx context.Context, persistence store.Interface) (*ateapipb.Actor, *workercache.Cache) {
 	t.Helper()
+	actor := seedAssignActor(t, ctx, persistence)
+	return actor, startWorkerCache(t, ctx, persistence)
+}
+
+// seedAssignActor stores one free gvisor worker and the SUSPENDED actor the
+// assignment tests resume, without starting a cache over them.
+func seedAssignActor(t *testing.T, ctx context.Context, persistence store.Interface) *ateapipb.Actor {
+	t.Helper()
+	seedFreeWorker(t, ctx, persistence, "pod-1")
+	return storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+}
+
+// seedFreeWorker stores an unclaimed active gvisor worker for the named pod.
+func seedFreeWorker(t *testing.T, ctx context.Context, persistence store.Interface, pod string) {
+	t.Helper()
 	if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("pod-1")},
+		Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID(pod)},
 		WorkerNamespace: "worker-ns",
 		WorkerPool:      "pool",
-		WorkerPod:       "pod-1",
-		WorkerPodUid:    testWorkerUID("pod-1"),
+		WorkerPod:       pod,
+		WorkerPodUid:    testWorkerUID(pod),
 		SandboxClass:    "gvisor",
 		Status: &ateapipb.WorkerStatus{
 			State: ateapipb.WorkerState_WORKER_STATE_ACTIVE,
 		},
 	}); err != nil {
-		t.Fatalf("CreateWorker: %v", err)
+		t.Fatalf("CreateWorker(%s): %v", pod, err)
 	}
-	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
-		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
-	})
+}
+
+// startWorkerCache starts a worker cache over backing and stops it with the
+// test. The relist interval is long enough that the cache only ever changes in
+// response to the events backing delivers.
+func startWorkerCache(t *testing.T, ctx context.Context, backing store.Interface) *workercache.Cache {
+	t.Helper()
 	cacheCtx, cancel := context.WithCancel(ctx)
 	t.Cleanup(cancel)
-	wc := workercache.New(persistence, time.Minute)
+	wc := workercache.New(backing, time.Minute)
 	if err := wc.Start(cacheCtx); err != nil {
 		t.Fatalf("workercache.Start: %v", err)
 	}
-	return actor, wc
+	return wc
 }
 
 // TestAssignWorkerAttempt_ConflictRefreshesActor verifies the actor write's
@@ -1159,5 +1208,133 @@ func TestLoadActorForResume_RunningActorShortCircuits(t *testing.T) {
 	}
 	if !src.SnapshotURI.IsZero() || !src.GoldenSnapshotURI.IsZero() {
 		t.Errorf("expected empty snapshot source, got %+v", src)
+	}
+}
+
+// frozenFleetStore feeds a worker cache the fleet as it stands when the cache
+// starts and then delivers nothing more, pinning the cache to that snapshot.
+// It exists so a test can state "the retry runs against a cache that has not
+// learned what the previous attempt wrote" as a fact rather than a race it
+// usually wins.
+type frozenFleetStore struct {
+	store.Interface
+}
+
+func (f *frozenFleetStore) WatchWorkers(context.Context) (*store.WorkerWatch, error) {
+	// Never written to and never closed: a closed channel would make the cache
+	// treat the watch as lost and relist, which is exactly what must not happen.
+	return store.NewWorkerWatch(make(chan store.WorkerEvent), func() {}), nil
+}
+
+// fixedOrderScheduler hands out the named workers one per Schedule call, in
+// order, so a retry lands on a different worker than the attempt before it.
+// The real scheduler picks at random among the free workers, which would let a
+// retry re-pick the worker a lost attempt had already claimed and hide the very
+// double-claim the test is looking for.
+type fixedOrderScheduler struct {
+	// Applies is the real scheduler's; only the choice is made deterministic.
+	scheduling.Scheduler
+	cache *workercache.Cache
+	order []string
+	calls int
+}
+
+func (f *fixedOrderScheduler) Schedule(context.Context, scheduling.Constraints) (*ateapipb.Worker, error) {
+	if f.calls >= len(f.order) {
+		return nil, scheduling.ErrNoCapacity
+	}
+	name := f.order[f.calls]
+	f.calls++
+	return f.cache.Worker(name)
+}
+
+// TestEnsureWorkerAssigned_RetryBindsExactlyOneWorker is the loop-level
+// counterpart to TestAssignWorkerAttempt_ConflictRefreshesActor: it asserts
+// what the whole retry loop leaves behind, not what one attempt returns.
+//
+// A concurrent spec write loses the first attempt's actor guard. The loop then
+// retries against a worker cache that is fed by the outbox watch and so need
+// not carry anything the lost attempt wrote, and picks from every worker that
+// still looks free. If the attempt's worker claim had committed on its own, the
+// retry would claim a second worker and strand the first, with no release path
+// pointing at it. Binding both rows in one write is what makes the count exact.
+//
+// Both sources of luck are removed so the assertion is a hard guard rather than
+// a probabilistic one: the cache is frozen at the pre-attempt fleet, and the
+// scheduler hands out pod-1 then pod-2. Split the bind back into two writes and
+// this fails every run.
+func TestEnsureWorkerAssigned_RetryBindsExactlyOneWorker(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+	actor := seedAssignActor(t, ctx, persistence)
+	// A second free worker, so the retry has somewhere else to go: with one
+	// worker the loop could only ever land back on the same row, which would
+	// prove nothing.
+	seedFreeWorker(t, ctx, persistence, "pod-2")
+	wc := startWorkerCache(t, ctx, &frozenFleetStore{Interface: persistence})
+
+	// An unleased write lands between the attempt's read and its write, exactly
+	// as an UpdateActor RPC on a SUSPENDED actor would. It leaves the actor
+	// SUSPENDED and its scheduling constraints alone, so the only thing the
+	// retry has to contend with is the version it lost.
+	st := &conflictInjectingStore{Interface: persistence, inject: func() {
+		fresh, err := persistence.GetActor(ctx, actorRef)
+		if err != nil {
+			t.Errorf("inject GetActor: %v", err)
+			return
+		}
+		if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(fresh), func(toUpdate *ateapipb.Actor) error {
+			toUpdate.Status.InProgressSnapshotName = "written-by-a-concurrent-writer"
+			return nil
+		}); err != nil {
+			t.Errorf("inject UpdateActor: %v", err)
+		}
+	}}
+
+	scheduler := &fixedOrderScheduler{
+		Scheduler: scheduling.New(wc),
+		cache:     wc,
+		order:     []string{testWorkerUID("pod-1"), testWorkerUID("pod-2")},
+	}
+	w := &ActorWorkflow{store: st, workerCache: wc, scheduler: scheduler}
+	tmpl := mustTemplateFromCRD(&atev1alpha1.ActorTemplate{
+		Spec: atev1alpha1.ActorTemplateSpec{SandboxClass: atev1alpha1.SandboxClassGvisor},
+	})
+
+	assignedActor, assignedWorker, err := w.ensureWorkerAssigned(ctx, actorRef, actor, tmpl)
+	if err != nil {
+		t.Fatalf("ensureWorkerAssigned: %v", err)
+	}
+	if scheduler.calls != 2 {
+		t.Fatalf("scheduler was called %d times, want 2: the injected conflict must have forced exactly one retry", scheduler.calls)
+	}
+	if got := assignedActor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		t.Errorf("assigned actor state = %v, want RESUMING", got)
+	}
+
+	workers, err := persistence.ListWorkers(ctx, store.ListOptions{})
+	if err != nil {
+		t.Fatalf("ListWorkers: %v", err)
+	}
+	var claimed []string
+	for _, worker := range workers.Items {
+		if worker.GetStatus().GetAssignment() != nil {
+			claimed = append(claimed, worker.GetWorkerPod())
+		}
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("%d workers carry an assignment (%v), want exactly 1: a lost actor guard must not leave a claim behind", len(claimed), claimed)
+	}
+	if claimed[0] != assignedWorker.GetWorkerPod() {
+		t.Errorf("the claimed worker is %q but the resume returned %q", claimed[0], assignedWorker.GetWorkerPod())
+	}
+
+	storedActor, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if got := storedActor.GetStatus().GetWorkerAssignment().GetWorkerPod(); got != claimed[0] {
+		t.Errorf("stored actor points at worker %q, but %q is the one claimed", got, claimed[0])
 	}
 }
