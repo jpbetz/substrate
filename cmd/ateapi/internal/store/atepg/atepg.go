@@ -180,7 +180,7 @@ func (p *Persistence) Close() {
 	}
 }
 
-// querier is satisfied by both *pgxpool.Pool and pgx.Tx, letting read helpers
+// querier is satisfied by both *pgxpool.Pool and pgx.Tx, letting row helpers
 // run either directly against the pool or inside an in-flight transaction.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -632,11 +632,22 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	if err := precondition.Validate(); err != nil {
 		return nil, err
 	}
+	return updateActorRow(ctx, p.pool, actorRef, precondition, mutate)
+}
+
+// updateActorRow applies mutate to the stored actor and writes it back with a
+// compare-and-set on the uid and version it read, so a concurrent write loses
+// the race instead of being silently overwritten. No row lock is taken, which
+// is what lets mutate run without a lock held across it.
+//
+// q is the pool for a standalone update, or the transaction for an update that
+// has to commit together with other writes.
+func updateActorRow(ctx context.Context, q querier, actorRef resources.ActorRef, precondition store.Precondition, mutate func(*ateapipb.Actor) error) (*ateapipb.Actor, error) {
 	atespace, name := actorRef.Atespace, actorRef.Name
 	var currentUID string
 	var currentVersion int64
 	var currentBytes []byte
-	if err := p.pool.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 			SELECT uid, version, proto FROM actors
 			WHERE atespace = $1 AND name = $2`, atespace, name).Scan(&currentUID, &currentVersion, &currentBytes); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -667,7 +678,7 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	if err != nil {
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
-	commandTag, err := p.pool.Exec(ctx, `
+	commandTag, err := q.Exec(ctx, `
 			UPDATE actors
 			SET version = $1, proto = $2
 			WHERE atespace = $3 AND name = $4 AND uid = $5 AND version = $6`,
@@ -1355,45 +1366,101 @@ func (p *Persistence) UpdateWorker(ctx context.Context, name string, preconditio
 		return nil, err
 	}
 	return p.writeAndAppendEvent(ctx, store.WorkerEventUpdated, func(ctx context.Context, tx pgx.Tx) (*ateapipb.Worker, error) {
-		dbWorker, err := getWorkerRowForUpdate(ctx, tx, name)
-		if err != nil {
-			return nil, err
-		}
-		if err := precondition.Check(dbWorker.GetMetadata()); err != nil {
-			return nil, err
-		}
+		return updateWorkerRow(ctx, tx, name, precondition, mutate)
+	})
+}
 
-		// Snapshot the stored state before handing the worker to mutate.
-		// mutate is free to edit anything it is given.
-		workerBeforeMutation := proto.Clone(dbWorker).(*ateapipb.Worker)
-		if err := mutate(dbWorker); err != nil {
-			return nil, err
-		}
-		if err := store.CheckWorkerMutation(workerBeforeMutation, dbWorker); err != nil {
-			return nil, err
-		}
-		// Stored metadata is authoritative; discard any metadata edits made by
-		// the closure and derive the next revision from the row we locked.
-		dbWorker.Metadata = newUpdateMetadata(workerBeforeMutation.GetMetadata())
+// updateWorkerRow reads the worker FOR UPDATE, checks the precondition against
+// the locked row, applies mutate and writes the result back. The row lock is
+// held for the rest of tx, so everything between the read and the commit is
+// serialized against other writers of the same worker.
+func updateWorkerRow(ctx context.Context, tx pgx.Tx, name string, precondition store.Precondition, mutate func(*ateapipb.Worker) error) (*ateapipb.Worker, error) {
+	dbWorker, err := getWorkerRowForUpdate(ctx, tx, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := precondition.Check(dbWorker.GetMetadata()); err != nil {
+		return nil, err
+	}
 
-		protoBytes, err := proto.Marshal(dbWorker)
-		if err != nil {
-			return nil, fmt.Errorf("marshaling worker: %w", err)
-		}
+	// Snapshot the stored state before handing the worker to mutate.
+	// mutate is free to edit anything it is given.
+	workerBeforeMutation := proto.Clone(dbWorker).(*ateapipb.Worker)
+	if err := mutate(dbWorker); err != nil {
+		return nil, err
+	}
+	if err := store.CheckWorkerMutation(workerBeforeMutation, dbWorker); err != nil {
+		return nil, err
+	}
+	// Stored metadata is authoritative; discard any metadata edits made by
+	// the closure and derive the next revision from the row we locked.
+	dbWorker.Metadata = newUpdateMetadata(workerBeforeMutation.GetMetadata())
 
-		commandTag, err := tx.Exec(ctx, `
+	protoBytes, err := proto.Marshal(dbWorker)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling worker: %w", err)
+	}
+
+	commandTag, err := tx.Exec(ctx, `
 			UPDATE workers
 			SET version = $1, proto = $2
 			WHERE name = $3`,
-			dbWorker.GetMetadata().GetVersion(), protoBytes, name)
+		dbWorker.GetMetadata().GetVersion(), protoBytes, name)
+	if err != nil {
+		return nil, fmt.Errorf("updating worker %s: %w", name, err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("updating worker %s affected %d rows, want 1", name, commandTag.RowsAffected())
+	}
+	return dbWorker, nil
+}
+
+// UpdateActorAndWorker writes both halves of an actor-to-worker binding in one
+// transaction. See store.Interface for the contract.
+//
+// The worker is locked first and the actor's compare-and-set follows, always in
+// that order, so two of these writes touching the same pair queue on the worker
+// row instead of deadlocking on opposite halves of it. Locking the contended
+// row first also means a bind that has already lost the worker gives up before
+// touching the actor at all.
+func (p *Persistence) UpdateActorAndWorker(ctx context.Context, actorRef resources.ActorRef, actorPrecondition store.Precondition, mutateActor func(*ateapipb.Actor) error, workerName string, workerPrecondition store.Precondition, mutateWorker func(*ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error) {
+	if err := actorPrecondition.Validate(); err != nil {
+		return nil, nil, err
+	}
+	if err := workerPrecondition.Validate(); err != nil {
+		return nil, nil, err
+	}
+
+	var updatedActor *ateapipb.Actor
+	updatedWorker, err := p.writeAndAppendEvent(ctx, store.WorkerEventUpdated, func(ctx context.Context, tx pgx.Tx) (*ateapipb.Worker, error) {
+		dbWorker, err := updateWorkerRow(ctx, tx, workerName, workerPrecondition, mutateWorker)
 		if err != nil {
-			return nil, fmt.Errorf("updating worker %s: %w", name, err)
+			return nil, guardError(store.ErrWorkerGuard, err)
 		}
-		if commandTag.RowsAffected() != 1 {
-			return nil, fmt.Errorf("updating worker %s affected %d rows, want 1", name, commandTag.RowsAffected())
+		dbActor, err := updateActorRow(ctx, tx, actorRef, actorPrecondition, mutateActor)
+		if err != nil {
+			return nil, guardError(store.ErrActorGuard, err)
 		}
+		updatedActor = dbActor
 		return dbWorker, nil
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return updatedActor, updatedWorker, nil
+}
+
+// guardError labels a two-object write's failure with the half it came from,
+// but only for the outcomes a caller acts on differently per half. A mutation's
+// own error, a marshaling failure or a lost connection say nothing about which
+// object the caller should re-read, so they pass through untouched.
+func guardError(guard, err error) error {
+	switch {
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrVersionConflict):
+		return fmt.Errorf("%w: %w", guard, err)
+	default:
+		return err
+	}
 }
 
 func (p *Persistence) DeleteWorker(ctx context.Context, name string, pre store.DeletePreconditions) (*ateapipb.Worker, error) {

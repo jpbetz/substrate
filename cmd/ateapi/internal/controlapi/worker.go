@@ -151,6 +151,13 @@ func (s *ServiceImpl) UpdateWorker(ctx context.Context, name string, preconditio
 	return s.store.UpdateWorker(ctx, name, precondition, mutate)
 }
 
+// UpdateActorAndWorker binds or releases an actor and a worker together. There
+// is no RPC for it: the actor-to-worker binding is decided by the workflows in
+// this process, so this layer only has to hand the pair down to the store.
+func (s *ServiceImpl) UpdateActorAndWorker(ctx context.Context, actorRef resources.ActorRef, actorPrecondition store.Precondition, mutateActor func(toUpdate *ateapipb.Actor) error, workerName string, workerPrecondition store.Precondition, mutateWorker func(toUpdate *ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error) {
+	return s.store.UpdateActorAndWorker(ctx, actorRef, actorPrecondition, mutateActor, workerName, workerPrecondition, mutateWorker)
+}
+
 func validateUpdateWorkerRequest(req *ateapipb.UpdateWorkerRequest) field.ErrorList {
 	var fldPath *field.Path
 

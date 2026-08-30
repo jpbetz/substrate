@@ -63,6 +63,15 @@ var (
 	// ErrImmutableField indicates an update's mutation changed a field that is
 	// immutable for the lifetime of the stored object.
 	ErrImmutableField = errors.New("persistence: immutable field")
+
+	// ErrActorGuard and ErrWorkerGuard name which half of a two-object write
+	// (UpdateActorAndWorker) landed on unexpected state. Each is reported
+	// alongside the sentinel describing the failure -- ErrNotFound,
+	// ErrUIDConflict or ErrVersionConflict -- so errors.Is matches both, and a
+	// caller that reacts differently to each half (re-read the actor, pick a
+	// different worker) can tell them apart without a second read.
+	ErrActorGuard  = errors.New("persistence: actor guard")
+	ErrWorkerGuard = errors.New("persistence: worker guard")
 )
 
 // Interface defines the contract for the persistence layer storing actor state.
@@ -221,6 +230,37 @@ type Interface interface {
 	// precondition no longer holds, ErrVersionConflict if the retry budget is
 	// exhausted, or the mutate's error verbatim otherwise.
 	UpdateWorker(ctx context.Context, name string, precondition Precondition, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error)
+
+	// UpdateActorAndWorker performs one transactional read-modify-write across
+	// an actor and a worker, and returns both stored objects with advanced
+	// metadata (version, update_time).
+	//
+	// It exists because the actor->worker binding lives in two rows. Writing
+	// them one at a time leaves a window in which the worker records a claim
+	// the actor knows nothing about; nothing reclaims such a worker, so the
+	// slot is lost until its pod dies. Here the worker's assignment and the
+	// actor's matching state both land, or neither does. The same primitive
+	// covers both directions, so the release paths (crash, suspend, pause,
+	// actor delete, worker delete) can move to it as they are converted.
+	//
+	// Each precondition is checked against its stored object before that
+	// object's mutation runs, and both require the uid and version guards.
+	// Calls naming the same worker are serialized against each other, so of
+	// two concurrent claims of one worker exactly one commits rather than the
+	// two interleaving; and neither object is held under a lock while the
+	// caller's mutation runs.
+	//
+	// Neither mutation is re-run on conflict. A lost guard is reported to the
+	// caller, because only the caller knows whether the other half of the
+	// binding is still the one it wants.
+	//
+	// Returns ErrPreconditionRequired if either precondition omits a guard, or
+	// ErrNotFound, ErrUIDConflict or ErrVersionConflict paired with
+	// ErrActorGuard or ErrWorkerGuard naming the half that failed. A mutation's
+	// own error, and ErrImmutableField from an illegal worker mutation, are
+	// returned verbatim. On any error nothing is written and no worker event is
+	// published.
+	UpdateActorAndWorker(ctx context.Context, actorRef resources.ActorRef, actorPrecondition Precondition, mutateActor func(toUpdate *ateapipb.Actor) error, workerName string, workerPrecondition Precondition, mutateWorker func(toUpdate *ateapipb.Worker) error) (*ateapipb.Actor, *ateapipb.Worker, error)
 
 	// Removes a worker by name and returns the deleted resource. Returns
 	// ErrNotFound if missing, or ErrUIDConflict/ErrVersionConflict if pre does

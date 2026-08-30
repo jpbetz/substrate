@@ -154,6 +154,7 @@ func RunContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
 	runActorContractTests(t, setup)
 	runEgressPolicyContractTests(t, setup)
 	runWorkerContractTests(t, setup)
+	runActorWorkerBindingContractTests(t, setup)
 	runAtespaceContractTests(t, setup)
 	runActorTemplateContractTests(t, setup)
 	runActorSnapshotContractTests(t, setup)
@@ -2086,6 +2087,504 @@ func runDebugContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 			t.Errorf("lease survived DebugClearAll: %v", err)
 		} else {
 			reacquired.Close()
+		}
+	})
+}
+
+// The actor used by the binding tests. Its name is separate from the actor
+// names the CRUD tests use so a fixture change there cannot quietly alter what
+// a binding test binds.
+const boundActorName = "bound-actor"
+
+// mustCreateBindableActor creates the atespace's actor in the state a resume
+// binds from.
+func mustCreateBindableActor(t *testing.T, s store.Interface, name string) *ateapipb.Actor {
+	t.Helper()
+	created, err := s.CreateActor(context.Background(), &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: "default",
+		ActorTemplateName:      "test-template",
+		Status:                 &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+	if err != nil {
+		t.Fatalf("CreateActor(%s) failed: %v", name, err)
+	}
+	return created
+}
+
+// bindMutations returns the pair of mutations a resume applies: the worker
+// records the claim, the actor records the assignment and moves to RESUMING.
+func bindMutations(actor *ateapipb.Actor, workerName string) (func(*ateapipb.Actor) error, func(*ateapipb.Worker) error) {
+	assignment := &ateapipb.ActorAssignment{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: actor.GetMetadata().GetAtespace(),
+			Name:     actor.GetMetadata().GetName(),
+		},
+		ActorUid: actor.GetMetadata().GetUid(),
+	}
+	return func(toUpdate *ateapipb.Actor) error {
+			toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+			toUpdate.Status.WorkerAssignment = &ateapipb.WorkerAssignment{
+				Worker: &ateapipb.ObjectRef{Name: workerName},
+			}
+			return nil
+		}, func(toUpdate *ateapipb.Worker) error {
+			toUpdate.Status.Assignment = assignment
+			return nil
+		}
+}
+
+// errMutationRefused stands in for a caller's own mutation error, which the
+// store must report verbatim rather than translating into a guard failure.
+var errMutationRefused = errors.New("storecontract: mutation refused")
+
+// unbindMutations returns the pair of mutations a release applies.
+func unbindMutations() (func(*ateapipb.Actor) error, func(*ateapipb.Worker) error) {
+	return func(toUpdate *ateapipb.Actor) error {
+			toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+			toUpdate.Status.WorkerAssignment = nil
+			return nil
+		}, func(toUpdate *ateapipb.Worker) error {
+			toUpdate.Status.Assignment = nil
+			return nil
+		}
+}
+
+// noWorkerEventWindow is how long expectNoWorkerEvent waits before concluding
+// that nothing was published. It is several times over the cadence at which a
+// store that delivers events from an outbox drains it, and deliberately short:
+// the wait is paid by every subtest below, and each of them independently
+// compares both rows before and after, so this asserts that no event escaped
+// rather than being the only evidence a write rolled back.
+const noWorkerEventWindow = 300 * time.Millisecond
+
+// expectNoWorkerEvent asserts that nothing was published on the watch. A rolled
+// back write publishes no event at all, so this waits out several polls of an
+// outbox rather than sampling the channel once.
+func expectNoWorkerEvent(t *testing.T, ch <-chan store.WorkerEvent) {
+	t.Helper()
+	select {
+	case event, ok := <-ch:
+		if !ok {
+			t.Fatal("watch channel closed unexpectedly")
+		}
+		t.Errorf("a rolled back write published worker event %v for %s", event.Type, event.Worker.GetMetadata().GetName())
+	case <-time.After(noWorkerEventWindow):
+	}
+}
+
+// runActorWorkerBindingContractTests covers UpdateActorAndWorker: the actor and
+// worker halves of a binding commit together or not at all, in both directions.
+func runActorWorkerBindingContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("UpdateActorAndWorker_Bind", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor := mustCreateBindableActor(t, s, boundActorName)
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		actorRef := resources.ActorRefFromActor(actor)
+
+		// Subscribe after the create so the create event doesn't pollute the channel.
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		mutateActor, mutateWorker := bindMutations(actor, testWorkerName)
+		boundActor, boundWorker, err := s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+		if err != nil {
+			t.Fatalf("UpdateActorAndWorker failed: %v", err)
+		}
+
+		if got := boundActor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+			t.Errorf("bound actor is %v, want RESUMING", got)
+		}
+		if got := boundActor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); got != testWorkerName {
+			t.Errorf("bound actor points at worker %q, want %q", got, testWorkerName)
+		}
+		if got := boundWorker.GetStatus().GetAssignment().GetActorUid(); got != actor.GetMetadata().GetUid() {
+			t.Errorf("bound worker claims actor uid %q, want %q", got, actor.GetMetadata().GetUid())
+		}
+		if got := boundActor.GetMetadata().GetVersion(); got != 2 {
+			t.Errorf("bound actor is at version %d, want 2", got)
+		}
+		if got := boundWorker.GetMetadata().GetVersion(); got != 2 {
+			t.Errorf("bound worker is at version %d, want 2", got)
+		}
+
+		storedActor, err := s.GetActor(ctx, actorRef)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if diff := cmp.Diff(storedActor, boundActor, protocmp.Transform()); diff != "" {
+			t.Errorf("UpdateActorAndWorker returned a different actor than it stored (-stored +returned):\n%s", diff)
+		}
+		storedWorker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if diff := cmp.Diff(storedWorker, boundWorker, protocmp.Transform()); diff != "" {
+			t.Errorf("UpdateActorAndWorker returned a different worker than it stored (-stored +returned):\n%s", diff)
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventUpdated {
+			t.Errorf("expected WorkerEventUpdated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(storedWorker, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("bind event worker mismatch (-want +got):\n%s", diff)
+		}
+		// The pair is one write, so it publishes one event, not one per row.
+		expectNoWorkerEvent(t, watch.Events)
+	})
+
+	t.Run("UpdateActorAndWorker_Unbind", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor := mustCreateBindableActor(t, s, boundActorName)
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		actorRef := resources.ActorRefFromActor(actor)
+
+		mutateActor, mutateWorker := bindMutations(actor, testWorkerName)
+		boundActor, boundWorker, err := s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+		if err != nil {
+			t.Fatalf("UpdateActorAndWorker (bind) failed: %v", err)
+		}
+
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		releaseActor, releaseWorker := unbindMutations()
+		freeActor, freeWorker, err := s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(boundActor), releaseActor, testWorkerName, store.PreconditionFrom(boundWorker), releaseWorker)
+		if err != nil {
+			t.Fatalf("UpdateActorAndWorker (unbind) failed: %v", err)
+		}
+		if freeActor.GetStatus().GetWorkerAssignment() != nil {
+			t.Errorf("unbound actor still points at %v", freeActor.GetStatus().GetWorkerAssignment())
+		}
+		if freeWorker.GetStatus().GetAssignment() != nil {
+			t.Errorf("unbound worker still claims %v", freeWorker.GetStatus().GetAssignment())
+		}
+
+		storedWorker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if storedWorker.GetStatus().GetAssignment() != nil {
+			t.Errorf("stored worker still claims %v", storedWorker.GetStatus().GetAssignment())
+		}
+		if got := storedWorker.GetMetadata().GetVersion(); got != 3 {
+			t.Errorf("worker is at version %d, want 3 (create, bind, unbind)", got)
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if diff := cmp.Diff(storedWorker, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("unbind event worker mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	// The two halves are guarded independently, and a lost guard on either one
+	// must leave both rows and the outbox exactly as they were.
+	for _, direction := range []struct {
+		name string
+		bind bool
+	}{{"Bind", true}, {"Unbind", false}} {
+		for _, stale := range []struct {
+			name  string
+			guard error
+		}{{"StaleActor", store.ErrActorGuard}, {"StaleWorker", store.ErrWorkerGuard}} {
+			t.Run("UpdateActorAndWorker_"+direction.name+"_"+stale.name, func(t *testing.T) {
+				s := setup(t)
+				ctx := context.Background()
+				mustCreateAtespace(t, s, testAtespace)
+				actor := mustCreateBindableActor(t, s, boundActorName)
+				worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+				if err != nil {
+					t.Fatalf("CreateWorker failed: %v", err)
+				}
+				actorRef := resources.ActorRefFromActor(actor)
+
+				// The unbind cases start from a bound pair, so a rollback there is
+				// observable as the binding still being in place.
+				if !direction.bind {
+					actor, worker, err = func() (*ateapipb.Actor, *ateapipb.Worker, error) {
+						mutateActor, mutateWorker := bindMutations(actor, testWorkerName)
+						return s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+					}()
+					if err != nil {
+						t.Fatalf("UpdateActorAndWorker (bind) failed: %v", err)
+					}
+				}
+
+				// Invalidate one guard by landing a write of our own on that half.
+				// The preconditions handed to the call below still name the version
+				// this test read, which is now one behind.
+				if stale.guard == store.ErrActorGuard {
+					if _, err := s.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
+						toUpdate.Status.InProgressSnapshotName = "written-by-a-concurrent-writer"
+						return nil
+					}); err != nil {
+						t.Fatalf("UpdateActor (concurrent) failed: %v", err)
+					}
+				} else {
+					if _, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(worker), func(toUpdate *ateapipb.Worker) error {
+						toUpdate.Status.State = ateapipb.WorkerState_WORKER_STATE_DRAINING
+						return nil
+					}); err != nil {
+						t.Fatalf("UpdateWorker (concurrent) failed: %v", err)
+					}
+				}
+
+				actorBefore, err := s.GetActor(ctx, actorRef)
+				if err != nil {
+					t.Fatalf("GetActor failed: %v", err)
+				}
+				workerBefore, err := s.GetWorker(ctx, testWorkerName)
+				if err != nil {
+					t.Fatalf("GetWorker failed: %v", err)
+				}
+
+				// Subscribe after the concurrent write so only events the failed
+				// call could publish can reach the channel.
+				watch, err := s.WatchWorkers(ctx)
+				if err != nil {
+					t.Fatalf("WatchWorkers failed: %v", err)
+				}
+				defer watch.Close()
+
+				var mutateActor func(*ateapipb.Actor) error
+				var mutateWorker func(*ateapipb.Worker) error
+				if direction.bind {
+					mutateActor, mutateWorker = bindMutations(actor, testWorkerName)
+				} else {
+					mutateActor, mutateWorker = unbindMutations()
+				}
+				_, _, err = s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+				if !errors.Is(err, store.ErrVersionConflict) {
+					t.Errorf("UpdateActorAndWorker error = %v, want one matching store.ErrVersionConflict", err)
+				}
+				if !errors.Is(err, stale.guard) {
+					t.Errorf("UpdateActorAndWorker error = %v, want one matching %v", err, stale.guard)
+				}
+
+				actorAfter, err := s.GetActor(ctx, actorRef)
+				if err != nil {
+					t.Fatalf("GetActor failed: %v", err)
+				}
+				if diff := cmp.Diff(actorBefore, actorAfter, protocmp.Transform()); diff != "" {
+					t.Errorf("a rejected write changed the actor (-before +after):\n%s", diff)
+				}
+				workerAfter, err := s.GetWorker(ctx, testWorkerName)
+				if err != nil {
+					t.Fatalf("GetWorker failed: %v", err)
+				}
+				if diff := cmp.Diff(workerBefore, workerAfter, protocmp.Transform()); diff != "" {
+					t.Errorf("a rejected write changed the worker (-before +after):\n%s", diff)
+				}
+				expectNoWorkerEvent(t, watch.Events)
+			})
+		}
+	}
+
+	// A mutation's own refusal is the caller's error, not a lost guard, so it
+	// is reported verbatim — and it still rolls the whole write back. The actor
+	// mutation is the interesting half: it runs after the worker row has
+	// already been written inside the transaction, so this is the one ordering
+	// in which a missing rollback would leave the worker changed.
+	for _, tt := range []struct {
+		name string
+		// failActor replaces the actor's mutation with one that refuses;
+		// mutate, when set, replaces the worker's.
+		failActor bool
+		mutate    func(*ateapipb.Worker) error
+		wantErr   error
+	}{
+		{
+			name:      "ActorMutationError",
+			failActor: true,
+			wantErr:   errMutationRefused,
+		},
+		{
+			name: "WorkerMutationImmutableField",
+			mutate: func(toUpdate *ateapipb.Worker) error {
+				toUpdate.WorkerPod = "some-other-pod"
+				return nil
+			},
+			wantErr: store.ErrImmutableField,
+		},
+	} {
+		t.Run("UpdateActorAndWorker_"+tt.name, func(t *testing.T) {
+			s := setup(t)
+			ctx := context.Background()
+			mustCreateAtespace(t, s, testAtespace)
+			actor := mustCreateBindableActor(t, s, boundActorName)
+			worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+			if err != nil {
+				t.Fatalf("CreateWorker failed: %v", err)
+			}
+			actorRef := resources.ActorRefFromActor(actor)
+
+			watch, err := s.WatchWorkers(ctx)
+			if err != nil {
+				t.Fatalf("WatchWorkers failed: %v", err)
+			}
+			defer watch.Close()
+
+			mutateActor, mutateWorker := bindMutations(actor, testWorkerName)
+			if tt.failActor {
+				mutateActor = func(*ateapipb.Actor) error { return errMutationRefused }
+			}
+			if tt.mutate != nil {
+				mutateWorker = tt.mutate
+			}
+
+			_, _, err = s.UpdateActorAndWorker(ctx, actorRef, store.PreconditionFrom(actor), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("UpdateActorAndWorker error = %v, want one matching %v", err, tt.wantErr)
+			}
+			// Reported as itself: labeling it with a guard would tell the
+			// caller to re-read an object that never moved.
+			if errors.Is(err, store.ErrActorGuard) || errors.Is(err, store.ErrWorkerGuard) {
+				t.Errorf("UpdateActorAndWorker error = %v, want no guard label on a mutation failure", err)
+			}
+			if errors.Is(err, store.ErrVersionConflict) {
+				t.Errorf("UpdateActorAndWorker error = %v, want no version conflict on a mutation failure", err)
+			}
+
+			actorAfter, err := s.GetActor(ctx, actorRef)
+			if err != nil {
+				t.Fatalf("GetActor failed: %v", err)
+			}
+			if diff := cmp.Diff(actor, actorAfter, protocmp.Transform()); diff != "" {
+				t.Errorf("a refused mutation changed the actor (-before +after):\n%s", diff)
+			}
+			workerAfter, err := s.GetWorker(ctx, testWorkerName)
+			if err != nil {
+				t.Fatalf("GetWorker failed: %v", err)
+			}
+			if diff := cmp.Diff(worker, workerAfter, protocmp.Transform()); diff != "" {
+				t.Errorf("a refused mutation changed the worker (-before +after):\n%s", diff)
+			}
+			expectNoWorkerEvent(t, watch.Events)
+		})
+	}
+
+	t.Run("UpdateActorAndWorker_MissingPrecondition", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor := mustCreateBindableActor(t, s, boundActorName)
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		actorRef := resources.ActorRefFromActor(actor)
+		good := func(pre store.Precondition) store.Precondition { return pre }
+
+		for _, tt := range []struct {
+			name      string
+			actorPre  store.Precondition
+			workerPre store.Precondition
+		}{
+			{"blind actor", store.Precondition{}, good(store.PreconditionFrom(worker))},
+			{"blind worker", good(store.PreconditionFrom(actor)), store.Precondition{}},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				_, _, err := s.UpdateActorAndWorker(ctx, actorRef, tt.actorPre, func(*ateapipb.Actor) error {
+					t.Error("actor mutation ran for a blind write")
+					return nil
+				}, testWorkerName, tt.workerPre, func(*ateapipb.Worker) error {
+					t.Error("worker mutation ran for a blind write")
+					return nil
+				})
+				if !errors.Is(err, store.ErrPreconditionRequired) {
+					t.Errorf("UpdateActorAndWorker error = %v, want one matching store.ErrPreconditionRequired", err)
+				}
+			})
+		}
+	})
+
+	// The reason the primitive exists: a worker hosts one actor, so when two
+	// resumes race for the last free worker exactly one may end up bound to it.
+	t.Run("UpdateActorAndWorker_ConcurrentBindsOfOneWorker", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		const claimants = 8
+		actors := make([]*ateapipb.Actor, claimants)
+		for i := range claimants {
+			actors[i] = mustCreateBindableActor(t, s, fmt.Sprintf("racing-actor-%d", i))
+		}
+
+		var wg sync.WaitGroup
+		won := make([]bool, claimants)
+		for i := range claimants {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mutateActor, mutateWorker := bindMutations(actors[i], testWorkerName)
+				_, _, err := s.UpdateActorAndWorker(ctx, resources.ActorRefFromActor(actors[i]), store.PreconditionFrom(actors[i]), mutateActor, testWorkerName, store.PreconditionFrom(worker), mutateWorker)
+				switch {
+				case err == nil:
+					won[i] = true
+				case errors.Is(err, store.ErrWorkerGuard) && errors.Is(err, store.ErrVersionConflict):
+				default:
+					t.Errorf("claimant %d: unexpected error %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+
+		winners := 0
+		for _, w := range won {
+			if w {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Fatalf("%d of %d claimants bound the worker, want exactly 1", winners, claimants)
+		}
+
+		storedWorker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := storedWorker.GetMetadata().GetVersion(); got != 2 {
+			t.Errorf("worker is at version %d, want 2 (create plus the single winning bind)", got)
+		}
+		// Every loser must have rolled back: only the winner's actor moved.
+		boundUID := storedWorker.GetStatus().GetAssignment().GetActorUid()
+		for i := range claimants {
+			got, err := s.GetActor(ctx, resources.ActorRefFromActor(actors[i]))
+			if err != nil {
+				t.Fatalf("GetActor failed: %v", err)
+			}
+			wantResuming := got.GetMetadata().GetUid() == boundUID
+			isResuming := got.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING
+			if isResuming != wantResuming {
+				t.Errorf("actor %d is %v (worker claims uid %q, actor uid is %q)", i, got.GetStatus().GetState(), boundUID, got.GetMetadata().GetUid())
+			}
+			if won[i] != wantResuming {
+				t.Errorf("actor %d: caller saw success=%v but the store shows bound=%v", i, won[i], wantResuming)
+			}
 		}
 	})
 }
