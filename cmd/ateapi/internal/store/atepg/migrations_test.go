@@ -40,6 +40,9 @@ func TestMigrationPolicy(t *testing.T) {
 		if strings.Count(sql, "-- +goose Up") != 1 {
 			t.Errorf("%s must contain exactly one Goose Up annotation", path)
 		}
+		if !strings.Contains(sql, "SET LOCAL lock_timeout") {
+			t.Errorf("%s must set a lock_timeout so DDL cannot block a table indefinitely", path)
+		}
 		if strings.Contains(upperSQL, "-- +GOOSE DOWN") {
 			t.Errorf("%s must not contain a Goose Down migration", path)
 		}

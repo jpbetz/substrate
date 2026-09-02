@@ -49,6 +49,7 @@ Store migration files in `cmd/ateapi/internal/store/atepg/migrations`.
 - Do not add SQL transaction control statements.
 - Do not use `IF NOT EXISTS` for a schema change.
 - Keep each startup migration short.
+- Start each migration with `SET LOCAL lock_timeout = '5s';` so DDL cannot queue behind a long-running query and block all access to a table. A timed-out migration rolls back, and the next startup retries it.
 
 Before the first stable v1 release, developers can change or squash migration files. Recreate a development database after its migration history changes.
 

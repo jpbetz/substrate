@@ -14,6 +14,8 @@
 
 -- +goose Up
 
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE atespaces (
     name     text PRIMARY KEY,
     uid      text NOT NULL,

@@ -110,13 +110,18 @@ func rejectUnversionedSubstrateSchema(ctx context.Context, pool *pgxpool.Pool) e
 	var hasMetadata, hasSubstrateTables bool
 	err := pool.QueryRow(ctx, `
 		SELECT
-			to_regclass('schema_migrations') IS NOT NULL,
+			EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = current_schema()
+				AND table_name = 'schema_migrations'
+			),
 			EXISTS (
 				SELECT 1 FROM information_schema.tables
 				WHERE table_schema = current_schema()
 				AND table_name IN (
-					'atespaces', 'actors', 'actor_templates',
-					'actor_snapshots', 'actor_snapshot_tags', 'workers',
+					'atespaces', 'actors', 'actor_egress_policies',
+					'actor_templates', 'actor_snapshots',
+					'actor_snapshot_tags', 'workers',
 					'worker_outbox', 'worker_outbox_default',
 					'worker_outbox_trim', 'leases'
 				)
@@ -132,6 +137,9 @@ func rejectUnversionedSubstrateSchema(ctx context.Context, pool *pgxpool.Pool) e
 
 func migrateToLatest(ctx context.Context, provider *goose.Provider) (migrationErr error) {
 	started := time.Now()
+	// This first read creates the migration ledger outside the migration
+	// advisory lock. That is safe: Goose probes for the table and retries a
+	// concurrent-create failure, so racing replicas converge.
 	current, latest, err := provider.GetVersions(ctx)
 	if err != nil {
 		return fmt.Errorf("get PostgreSQL migration versions: %w", err)

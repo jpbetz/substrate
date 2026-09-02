@@ -51,6 +51,10 @@ for migration in "${migrations[@]}"; do
     echo "Migration file ${name} must contain a Goose Up annotation." >&2
     exit 1
   fi
+  if ! grep -Fq -- 'SET LOCAL lock_timeout' "${migration}"; then
+    echo "Migration file ${name} must start with SET LOCAL lock_timeout so DDL cannot block a table indefinitely." >&2
+    exit 1
+  fi
   if grep -Fiq -- '-- +goose Down' "${migration}"; then
     echo "Migration file ${name} must not contain a Goose Down migration." >&2
     exit 1
