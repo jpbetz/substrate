@@ -66,9 +66,9 @@ var _ store.Interface = (*Persistence)(nil)
 // PostgreSQL connection. Callers can retry this error before startup.
 var ErrUnavailable = errors.New("PostgreSQL is unavailable")
 
-// Connect opens a pgxpool against dsn, creates schema if necessary, and
-// applies pending schema migrations. A dedicated watch pool isolates outbox
-// polling and maintenance from writes.
+// Connect opens a pgxpool against dsn, ensures the configured schema exists,
+// and applies pending schema migrations. A dedicated watch pool isolates
+// outbox polling and maintenance from writes.
 func Connect(ctx context.Context, dsn, schema string) (*Persistence, error) {
 	if schema == "" {
 		return nil, fmt.Errorf("PostgreSQL schema must not be empty")
@@ -86,7 +86,7 @@ func Connect(ctx context.Context, dsn, schema string) (*Persistence, error) {
 		pool.Close()
 		return nil, fmt.Errorf("%w: pinging PostgreSQL: %w", ErrUnavailable, err)
 	}
-	if err := createSchema(ctx, pool, schema); err != nil {
+	if err := ensureSchema(ctx, pool, schema); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -110,18 +110,41 @@ func Connect(ctx context.Context, dsn, schema string) (*Persistence, error) {
 	return p, nil
 }
 
-func createSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
+// ensureSchema checks the startup precondition for everything that follows:
+// the configured schema exists, or the connecting role can create it. With
+// the precondition established up front, migrations and the rest of startup
+// run against a schema known to exist and need no privilege guards, and a
+// missing grant surfaces as one actionable error instead of a failed DDL
+// statement. CREATE SCHEMA IF NOT EXISTS would not do here: PostgreSQL
+// checks CREATE privilege on the database before the existence bail-out, so
+// it fails for a least-privilege role even when the schema exists.
+func ensureSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("starting PostgreSQL schema transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // Commit or the returned error decides the outcome.
 
+	// The advisory lock serializes replicas racing to create the schema.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "agent-substrate:create-schema:"+schema); err != nil {
 		return fmt.Errorf("locking PostgreSQL schema %q: %w", schema, err)
 	}
-	if _, err := tx.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{schema}.Sanitize()); err != nil {
-		return fmt.Errorf("creating PostgreSQL schema %q: %w", schema, err)
+	var exists, canCreate bool
+	var role, database string
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1),
+			has_database_privilege(current_database(), 'CREATE'),
+			current_user, current_database()`, schema).Scan(&exists, &canCreate, &role, &database); err != nil {
+		return fmt.Errorf("checking PostgreSQL schema %q: %w", schema, err)
+	}
+	if !exists {
+		if !canCreate {
+			return fmt.Errorf("PostgreSQL schema %q does not exist and role %q cannot create it: create the schema, or grant the role CREATE on database %q", schema, role, database)
+		}
+		if _, err := tx.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{schema}.Sanitize()); err != nil {
+			return fmt.Errorf("creating PostgreSQL schema %q: %w", schema, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing PostgreSQL schema %q: %w", schema, err)

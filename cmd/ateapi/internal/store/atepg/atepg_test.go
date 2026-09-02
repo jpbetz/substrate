@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -282,6 +283,53 @@ func TestConnectUsesConfiguredSchema(t *testing.T) {
 	}
 	if !unrelatedPartitionExists {
 		t.Error("outbox maintenance removed a partition from another schema")
+	}
+}
+
+// TestConnectLeastPrivilegeRole covers the managed-database posture: a role
+// with a pre-provisioned schema and no CREATE on the database. Connect must
+// work with the granted schema and fail the precondition check, not a DDL
+// statement, when the schema is missing.
+func TestConnectLeastPrivilegeRole(t *testing.T) {
+	pool := requirePool(t)
+	ctx := t.Context()
+	reset := `
+		DROP SCHEMA IF EXISTS "least-priv" CASCADE;
+		DO $$ BEGIN
+			IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'atepg_least_priv') THEN
+				DROP OWNED BY atepg_least_priv CASCADE;
+				DROP ROLE atepg_least_priv;
+			END IF;
+		END $$;`
+	if _, err := pool.Exec(ctx, reset+`
+		CREATE ROLE atepg_least_priv LOGIN PASSWORD 'least-priv';
+		CREATE SCHEMA "least-priv";
+		GRANT USAGE, CREATE ON SCHEMA "least-priv" TO atepg_least_priv`); err != nil {
+		t.Fatalf("preparing least-privilege role: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), reset)
+	})
+
+	limited, err := url.Parse(containerDSN)
+	if err != nil {
+		t.Fatalf("parsing container DSN: %v", err)
+	}
+	limited.User = url.UserPassword("atepg_least_priv", "least-priv")
+
+	p, err := Connect(ctx, limited.String(), "least-priv")
+	if err != nil {
+		t.Fatalf("Connect with a pre-provisioned schema and no database CREATE failed: %v", err)
+	}
+	if _, err := p.CreateAtespace(ctx, newTestAtespace("least-priv-test")); err != nil {
+		t.Errorf("creating atespace as the least-privilege role: %v", err)
+	}
+	p.Close()
+	p.pool.Close()
+
+	_, err = Connect(ctx, limited.String(), "least-priv-missing")
+	if err == nil || !strings.Contains(err.Error(), "cannot create it") {
+		t.Fatalf("Connect error = %v, want the schema precondition error", err)
 	}
 }
 
