@@ -836,6 +836,7 @@ func (p *Persistence) listActorsGlobal(ctx context.Context, pageSize int32, page
 	}
 
 	rows, err := p.pool.Query(ctx, `
+		-- cross-partition: the global listing walks every atespace in key order.
 		SELECT atespace, name, proto FROM actors
 		WHERE $1::text IS NULL OR (atespace, name) > ($1, $2)
 		ORDER BY atespace, name
