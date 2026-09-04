@@ -38,7 +38,11 @@ import (
 // schema change or query that would not work in that layout.
 func TestActorsPartitionableByAtespace(t *testing.T) {
 	rec := &queryRecorder{}
-	pool := newPartitionedPool(t, "partitioned", rec)
+	pool := newMigratedPool(t, "partitioned", rec)
+	if err := partitionActors(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	rec.active.Store(true)
 
 	storecontract.RunContractTests(t, func(t *testing.T) store.Interface {
 		t.Helper()
@@ -56,7 +60,7 @@ func TestActorsPartitionableByAtespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	if checked == 0 {
-		t.Fatal("no statements on partitioned tables were recorded")
+		t.Fatal("no statements on actors were recorded")
 	}
 	for _, f := range fanOuts {
 		t.Error(f)
@@ -66,22 +70,25 @@ func TestActorsPartitionableByAtespace(t *testing.T) {
 // TestActorsPartitionableByAtespaceRejects shows what the partitioned schema rejects.
 func TestActorsPartitionableByAtespaceRejects(t *testing.T) {
 	t.Run("unique index omitting the key", func(t *testing.T) {
-		pool := newTracedPool(t, "partitioned-unique", &queryRecorder{})
-		migrate(t, pool)
+		pool := newMigratedPool(t, "partitioned-unique", &queryRecorder{})
 		// This also rules out foreign keys onto uid, which need this index.
 		if _, err := pool.Exec(t.Context(), `CREATE UNIQUE INDEX actors_uid_key ON actors (uid)`); err != nil {
 			t.Fatal(err)
 		}
-		err := partitionTable(t.Context(), pool, "actors", "atespace")
+		err := partitionActors(t.Context(), pool)
 		if err == nil || !strings.Contains(err.Error(), "must include all partitioning columns") {
-			t.Fatalf("partitionTable error = %v, want unique index rejection", err)
+			t.Fatalf("partitionActors error = %v, want unique index rejection", err)
 		}
 		t.Log(err)
 	})
 
 	t.Run("query without the key reads every partition", func(t *testing.T) {
 		rec := &queryRecorder{}
-		pool := newPartitionedPool(t, "partitioned-fanout", rec)
+		pool := newMigratedPool(t, "partitioned-fanout", rec)
+		if err := partitionActors(t.Context(), pool); err != nil {
+			t.Fatal(err)
+		}
+		rec.active.Store(true)
 		var n int
 		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM actors WHERE uid = $1`, "u1").Scan(&n); err != nil {
 			t.Fatal(err)
@@ -97,14 +104,6 @@ func TestActorsPartitionableByAtespaceRejects(t *testing.T) {
 	})
 }
 
-// partitionKeys maps each table the test partitions to its partition column.
-var partitionKeys = map[string]string{
-	"actors": "atespace",
-}
-
-// Two partitions are enough to expose every partitioning constraint.
-const partitionCount = 2
-
 // fanOutAllowlist holds the statements allowed to read more than one
 // partition, keyed by whitespace-normalized SQL.
 var fanOutAllowlist = map[string]string{
@@ -115,71 +114,37 @@ var fanOutAllowlist = map[string]string{
 		LIMIT $3`): "global ListActors is a keyset scan over every atespace",
 }
 
-// partitionTable rebuilds table as a hash-partitioned table on key, keeping
-// its rows, indexes, constraints and foreign keys. PostgreSQL rejects the
-// rebuild for any index or foreign key that omits key.
-func partitionTable(ctx context.Context, pool *pgxpool.Pool, table, key string) error {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
-
-	type fk struct{ table, name, def string }
-	var fks []fk
-	rows, err := tx.Query(ctx, `
-		SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid)
+// partitionActors rebuilds the empty, freshly migrated actors table as a
+// two-way hash-partitioned table on atespace, keeping its indexes,
+// constraints and foreign keys. PostgreSQL rejects the rebuild for any index
+// or foreign key that omits atespace.
+func partitionActors(ctx context.Context, pool *pgxpool.Pool) error {
+	// LIKE ... INCLUDING ALL copies everything but foreign keys, so those are
+	// captured first and re-added after the swap.
+	rows, err := pool.Query(ctx, `
+		SELECT format('ALTER TABLE %s ADD CONSTRAINT %I %s', conrelid::regclass, conname, pg_get_constraintdef(oid))
 		FROM pg_constraint
-		WHERE contype = 'f' AND (conrelid = $1::regclass OR confrelid = $1::regclass)
-		ORDER BY conname`, table)
+		WHERE contype = 'f' AND 'actors'::regclass IN (conrelid, confrelid)
+		ORDER BY conname`)
 	if err != nil {
-		return fmt.Errorf("listing foreign keys of %s: %w", table, err)
-	}
-	for rows.Next() {
-		var f fk
-		if err := rows.Scan(&f.table, &f.name, &f.def); err != nil {
-			rows.Close()
-			return err
-		}
-		fks = append(fks, f)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
-
-	q := func(s string) string { return pgx.Identifier{s}.Sanitize() }
-	tmp := table + "_partitioned"
-	// LIKE ... INCLUDING ALL replays every index and constraint the migrations
-	// created. Foreign keys are not copied and are re-added below.
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (LIKE %s INCLUDING ALL) PARTITION BY HASH (%s)`, q(tmp), q(table), q(key))); err != nil {
-		return fmt.Errorf("table %s cannot be partitioned by %s: %w", table, key, err)
-	}
-	for i := 0; i < partitionCount; i++ {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d)`, q(fmt.Sprintf("%s_p%d", table, i)), q(tmp), partitionCount, i)); err != nil {
-			return fmt.Errorf("creating partition %d of %s: %w", i, table, err)
-		}
-	}
-	for _, f := range fks {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT %s`, f.table, q(f.name))); err != nil {
-			return fmt.Errorf("dropping foreign key %s: %w", f.name, err)
-		}
-	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s SELECT * FROM %s`, q(tmp), q(table))); err != nil {
-		return fmt.Errorf("copying %s rows into partitions: %w", table, err)
-	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, q(table))); err != nil {
+	addForeignKeys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s RENAME TO %s`, q(tmp), q(table))); err != nil {
-		return err
+	// A single Exec runs the statements in one transaction.
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE actors_partitioned (LIKE actors INCLUDING ALL) PARTITION BY HASH (atespace);
+		CREATE TABLE actors_p0 PARTITION OF actors_partitioned FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+		CREATE TABLE actors_p1 PARTITION OF actors_partitioned FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+		DROP TABLE actors CASCADE;
+		ALTER TABLE actors_partitioned RENAME TO actors;
+		`+strings.Join(addForeignKeys, ";\n"))
+	if err != nil {
+		return fmt.Errorf("actors cannot be partitioned by atespace: %w", err)
 	}
-	for _, f := range fks {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s %s`, f.table, q(f.name), f.def)); err != nil {
-			return fmt.Errorf("foreign key %s on %s cannot reference %s partitioned by %s: %w", f.name, f.table, table, key, err)
-		}
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // queryRecorder is a pgx tracer that keeps every distinct statement the store
@@ -209,17 +174,11 @@ func (r *queryRecorder) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQuery
 
 var (
 	whitespaceRE = regexp.MustCompile(`\s+`)
-	literalRE    = regexp.MustCompile(`'[^']*'`)
+	actorsRE     = regexp.MustCompile(`\bactors\b`)
 )
 
 func normalizeSQL(sql string) string {
 	return strings.TrimSpace(whitespaceRE.ReplaceAllString(sql, " "))
-}
-
-// mentionsTable reports whether sql names table outside string literals.
-func mentionsTable(sql, table string) bool {
-	stripped := literalRE.ReplaceAllString(sql, "''")
-	return regexp.MustCompile(`\b` + regexp.QuoteMeta(table) + `\b`).MatchString(stripped)
 }
 
 // explainable reports whether EXPLAIN accepts the statement.
@@ -233,19 +192,18 @@ func explainable(sql string) bool {
 
 // fanOut is a recorded statement whose plan reads more than one partition.
 type fanOut struct {
-	table      string
 	sql        string
 	args       []any
 	partitions []string
 }
 
 func (f fanOut) String() string {
-	return fmt.Sprintf("statement on %s reads partitions %v instead of one; filter on %s or add a fanOutAllowlist entry:\n\t%s\n\targs=%v", f.table, f.partitions, partitionKeys[f.table], normalizeSQL(f.sql), f.args)
+	return fmt.Sprintf("statement on actors reads partitions %v instead of one; filter on atespace or add a fanOutAllowlist entry:\n\t%s\n\targs=%v", f.partitions, normalizeSQL(f.sql), f.args)
 }
 
-// findFanOuts replays each recorded statement on a partitioned table under
-// EXPLAIN and returns the ones whose plan reads more than one partition.
-// EXPLAIN without ANALYZE plans but never executes, so writes are safe.
+// findFanOuts replays each recorded statement on actors under EXPLAIN and
+// returns the ones whose plan reads more than one partition. EXPLAIN without
+// ANALYZE plans but never executes, so writes are safe.
 func findFanOuts(ctx context.Context, pool *pgxpool.Pool, rec *queryRecorder, allowlist map[string]string) (checked int, out []fanOut, err error) {
 	rec.mu.Lock()
 	var sqls []string
@@ -256,31 +214,26 @@ func findFanOuts(ctx context.Context, pool *pgxpool.Pool, rec *queryRecorder, al
 	sort.Strings(sqls)
 
 	for _, sql := range sqls {
-		if !explainable(sql) {
+		if !explainable(sql) || !actorsRE.MatchString(sql) {
 			continue
 		}
 		if _, ok := allowlist[normalizeSQL(sql)]; ok {
 			continue
 		}
-		for table := range partitionKeys {
-			if !mentionsTable(sql, table) {
-				continue
-			}
-			checked++
-			partitions, err := partitionsRead(ctx, pool, sql, rec.stmts[sql], table)
-			if err != nil {
-				return 0, nil, fmt.Errorf("explaining %q: %w", normalizeSQL(sql), err)
-			}
-			if len(partitions) > 1 {
-				out = append(out, fanOut{table: table, sql: sql, args: rec.stmts[sql], partitions: partitions})
-			}
+		checked++
+		partitions, err := partitionsRead(ctx, pool, sql, rec.stmts[sql])
+		if err != nil {
+			return 0, nil, fmt.Errorf("explaining %q: %w", normalizeSQL(sql), err)
+		}
+		if len(partitions) > 1 {
+			out = append(out, fanOut{sql: sql, args: rec.stmts[sql], partitions: partitions})
 		}
 	}
 	return checked, out, nil
 }
 
-// partitionsRead returns the partitions of table that the plan for sql reads.
-func partitionsRead(ctx context.Context, pool *pgxpool.Pool, sql string, args []any, table string) ([]string, error) {
+// partitionsRead returns the actors partitions that the plan for sql reads.
+func partitionsRead(ctx context.Context, pool *pgxpool.Pool, sql string, args []any) ([]string, error) {
 	var plan []byte
 	if err := pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, args...).Scan(&plan); err != nil {
 		return nil, err
@@ -294,7 +247,7 @@ func partitionsRead(ctx context.Context, pool *pgxpool.Pool, sql string, args []
 	walk = func(node any) {
 		switch n := node.(type) {
 		case map[string]any:
-			if name, ok := n["Relation Name"].(string); ok && strings.HasPrefix(name, table+"_p") {
+			if name, ok := n["Relation Name"].(string); ok && strings.HasPrefix(name, "actors_p") {
 				seen[name] = true
 			}
 			for _, child := range n {
@@ -315,33 +268,17 @@ func partitionsRead(ctx context.Context, pool *pgxpool.Pool, sql string, args []
 	return partitions, nil
 }
 
-// newPartitionedPool opens a traced pool on a fresh schema, applies the
-// migrations, and partitions the tables in partitionKeys. The schema is
-// dropped when the test ends.
-func newPartitionedPool(t *testing.T, schema string, rec *queryRecorder) *pgxpool.Pool {
+// newMigratedPool opens a pool traced by rec on a fresh schema, applies the
+// migrations, and drops the schema when the test ends.
+func newMigratedPool(t *testing.T, schema string, rec *queryRecorder) *pgxpool.Pool {
 	t.Helper()
-	pool := newTracedPool(t, schema, rec)
-	migrate(t, pool)
-	for table, key := range partitionKeys {
-		if err := partitionTable(t.Context(), pool, table, key); err != nil {
-			t.Fatalf("partitioning %s: %v", table, err)
-		}
-	}
-	rec.active.Store(true)
-	return pool
-}
-
-func newTracedPool(t *testing.T, schema string, rec *queryRecorder) *pgxpool.Pool {
-	t.Helper()
-	admin := requirePool(t)
 	ctx := t.Context()
+	admin := requirePool(t)
 	quoted := pgx.Identifier{schema}.Sanitize()
 	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS `+quoted+` CASCADE; CREATE SCHEMA `+quoted); err != nil {
-		t.Fatalf("creating schema %s: %v", schema, err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+quoted+` CASCADE`)
-	})
+	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DROP SCHEMA `+quoted+` CASCADE`) })
 	cfg, err := pgxpool.ParseConfig(containerDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -350,17 +287,13 @@ func newTracedPool(t *testing.T, schema string, rec *queryRecorder) *pgxpool.Poo
 	cfg.ConnConfig.Tracer = rec
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		t.Fatalf("opening pool: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return pool
-}
-
-func migrate(t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	p, err := NewPersistence(t.Context(), pool)
+	p, err := NewPersistence(ctx, pool)
 	if err != nil {
 		t.Fatalf("NewPersistence: %v", err)
 	}
 	p.Close()
+	return pool
 }
